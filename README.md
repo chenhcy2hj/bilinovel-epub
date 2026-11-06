@@ -25,6 +25,9 @@
 3. Tampermonkey 会弹出安装页，点击「安装」；
 4. 确认脚本在 `www.linovelib.com` / `w.linovelib.com` 上已启用。
 
+> 直接安装地址（复制到浏览器地址栏，Tampermonkey 会自动弹出安装页）：
+> `https://raw.githubusercontent.com/chenhcy2hj/bilinovel-epub/main/bilinovel-epub.user.js`
+
 > 也可以把脚本内容整体复制到 Tampermonkey 的「添加新脚本」里保存。
 
 ## 使用
