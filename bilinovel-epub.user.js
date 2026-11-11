@@ -1,9 +1,11 @@
 // ==UserScript==
 // @name         哔哩轻小说 (linovelib) 分卷 EPUB 下载器
 // @namespace    https://www.linovelib.com/
-// @version      1.5.0
-// @description  在哔哩轻小说分卷详情页（/novel/{id}/vol_{n}.html）新增 EPUB 下载按钮，支持cid(0)双向修复、TTF字体轮廓解密、插图并发重试、正文顺序通道探测与EPUB 2.0打包
+// @version      1.6.0
+// @description  在哔哩轻小说分卷详情页（/novel/{id}/vol_{n}.html）新增 EPUB 下载按钮，支持cid(0)双向修复、TTF字体轮廓解密、插图并发重试、正文乱序还原（iframe）与EPUB 2.0打包
 // @author       MVP-Builder
+// @updateURL    https://raw.githubusercontent.com/chenhcy2hj/bilinovel-epub/main/bilinovel-epub.user.js
+// @downloadURL  https://raw.githubusercontent.com/chenhcy2hj/bilinovel-epub/main/bilinovel-epub.user.js
 // @match        https://www.linovelib.com/novel/*.html
 // @match        https://www.linovelib.com/novel/*/catalog*
 // @match        https://w.linovelib.com/novel/*.html
@@ -37,10 +39,10 @@
     COVER_TIMEOUT: 6000,       // 封面单次请求超时 (ms)
     MOUNT_RETRY_TIMES: 10,     // 页面异步渲染时按钮挂载的轮询次数
     MOUNT_RETRY_INTERVAL: 800, // 上述轮询间隔 (ms)；另叠加 MutationObserver
-    PROBE_TEXT_ORDER: true,    // 是否探测「XHR 与真实导航取文顺序是否一致」
-    FRAME_TIMEOUT: 15000,      // 同源 iframe 取文超时 (ms)
-    FRAME_PROBE_TIMEOUT: 8000, // 通道探测时 iframe 的超时 (ms)，避免整卷被卡住
-    FRAME_SETTLE: 400,         // iframe load 后等待站点脚本跑完的静置时间 (ms)
+    TEXT_FRAME: true,          // 是否用隐藏 iframe 跑站点脚本取文（XHR 拿到的是乱序正文）
+    TEXT_FRAME_TIMEOUT: 15000, // 单页 iframe 加载超时 (ms)
+    TEXT_UNSCRAMBLE_WAIT: 9000,// 等待站点「段落还原」脚本的最长时间 (ms)，实测约 2.5s
+    TEXT_UNSCRAMBLE_POLL: 250, // 上述等待的轮询间隔 (ms)
   };
 
   /**
@@ -257,6 +259,81 @@
    * 格式: { "a1b2c3d4": "的", ... }
    */
   const BUILTIN_GLYPH_HASH_MAP = {};
+
+  /**
+   * 取文轮询节拍器
+   *
+   * 标签页切到后台后 Chrome 会把 setTimeout 降频（隐藏久了甚至 1 分钟一次），表现为
+   * 「iframe 早已还原完、脚本还在等」。Worker 里的定时器不受该降频影响，所以用 Worker 发节拍，
+   * 主线程收到消息后再检查 iframe DOM；Worker/Blob 被 CSP 拦下时退回普通 setInterval。
+   */
+  const TextTicker = {
+    worker: null,
+    subs: new Set(),
+    ensure() {
+      if (this.worker) return true;
+      try {
+        if (typeof Worker === 'undefined' || typeof Blob === 'undefined' || typeof URL === 'undefined') {
+          return false;
+        }
+        const url = URL.createObjectURL(
+          new Blob(['setInterval(function(){postMessage(0)},120);'], { type: 'text/javascript' })
+        );
+        const worker = new Worker(url);
+        worker.onmessage = () => {
+          for (const fn of Array.from(this.subs)) {
+            try {
+              fn();
+            } catch (e) {
+              /* 单个订阅者异常不影响其它轮询 */
+            }
+          }
+        };
+        this.worker = worker;
+        return true;
+      } catch (e) {
+        this.worker = null;
+        return false;
+      }
+    },
+    subscribe(fn) {
+      if (!this.ensure()) {
+        const timer = setInterval(fn, 300);
+        return () => clearInterval(timer);
+      }
+      this.subs.add(fn);
+      return () => {
+        this.subs.delete(fn);
+        if (this.subs.size === 0) this.dispose();
+      };
+    },
+    dispose() {
+      if (!this.worker) return;
+      try {
+        this.worker.terminate();
+      } catch (e) {
+        /* ignore */
+      }
+      this.worker = null;
+    },
+    sleep(ms) {
+      return new Promise((resolve) => {
+        const startedAt = Date.now();
+        let done = false;
+        let unsub = () => {};
+        const finish = () => {
+          if (done) return;
+          done = true;
+          unsub();
+          resolve();
+        };
+        unsub = this.subscribe(() => {
+          if (Date.now() - startedAt >= ms) finish();
+        });
+        if (!this.worker) setTimeout(finish, ms + 50);
+      });
+    },
+  };
 
   /********************************************************************
    * 1. 基础工具函数 (延时、HTTP 请求、XML 转义、并发池)
@@ -484,72 +561,208 @@
     },
 
     /**
-     * 用「真实导航」(同源 iframe) 取页面，返回脚本执行完毕后的 DOM 快照
+     * 摘掉站点塞进正文的「诱饵段落」
      *
-     * 为什么需要它：站点会对「脚本请求(XHR/fetch)」与「浏览器导航」下发**不同段落顺序**的正文
-     * （反爬乱序），只有真实导航拿到的才是读者在浏览器里看到的顺序。GM_xmlhttpRequest 无论如何
-     * 改请求头都无法变成一次导航（Sec-Fetch-* 属于浏览器的禁止头），因此这里退回到 iframe：
-     * 同源 iframe 是一次货真价实的导航，且站点只设置了 X-Frame-Options: SAMEORIGIN，允许同源嵌入。
+     * 站点还原段落顺序时会额外插入 20 个与原文完全相同的副本，再用动态插入的样式
+     * `#TextContent p[data-kXXXX] { position:absolute; transform:scale(0) }` 把它们藏起来。
+     * 这里不依赖布局（后台标签页的 getBoundingClientRect 可能全是 0），而是解析 CSSOM
+     * 找出被隐藏的属性名，再按属性删除对应段落；最后用内联样式/计算样式兜底。
      *
-     * 返回 null 表示不可用（被嵌入策略拦截、超时、跨域等），调用方应回退 XHR。
+     * @returns {number} 删除的段落数
+     */
+    stripDecoyParagraphs(doc) {
+      if (!doc || !doc.querySelectorAll) return 0;
+      const hiddenAttrs = new Set();
+
+      try {
+        const sheets = Array.from(doc.styleSheets || []);
+        for (const sheet of sheets) {
+          let rules = null;
+          try {
+            rules = sheet.cssRules;
+          } catch (e) {
+            continue; // 跨域样式表不可读，跳过
+          }
+          for (const rule of Array.from(rules || [])) {
+            const text = rule.cssText || '';
+            if (!/scale\(\s*0(?:\.0+)?\s*\)|display\s*:\s*none/i.test(text)) continue;
+            const re = /\[([a-zA-Z0-9_-]+)\]/g;
+            let m;
+            while ((m = re.exec(text))) hiddenAttrs.add(m[1]);
+          }
+        }
+      } catch (e) {
+        /* ignore */
+      }
+
+      let removed = 0;
+      const nodes = Array.from(doc.querySelectorAll('#TextContent p, #acontent p, .read-content p'));
+      for (const p of nodes) {
+        let hidden = false;
+        for (const attr of hiddenAttrs) {
+          if (p.hasAttribute(attr)) {
+            hidden = true;
+            break;
+          }
+        }
+        if (!hidden) {
+          const style = p.getAttribute('style') || '';
+          if (/display\s*:\s*none|visibility\s*:\s*hidden|scale\(\s*0|font-size\s*:\s*0/i.test(style)) {
+            hidden = true;
+          } else {
+            try {
+              const view = doc.defaultView;
+              const cs = view && view.getComputedStyle ? view.getComputedStyle(p) : null;
+              const zeroTransform = /^matrix\(0(?:,\s*0){5}\)$/.test((cs && cs.transform || '').trim());
+              if (cs && (cs.display === 'none' || cs.visibility === 'hidden' || (zeroTransform && cs.position === 'absolute'))) {
+                hidden = true;
+              }
+            } catch (e) {
+              /* ignore */
+            }
+          }
+        }
+        if (hidden) {
+          p.remove();
+          removed += 1;
+        }
+      }
+      return removed;
+    },
+
+    /** 正文里是否出现完全相同的段落（站点还原段落顺序后会插入 20 个诱饵副本） */
+    hasDuplicateParagraphs(doc) {
+      if (!doc || !doc.querySelectorAll) return false;
+      const seen = new Set();
+      for (const p of Array.from(doc.querySelectorAll('#TextContent p, #acontent p, .read-content p'))) {
+        const text = (p.textContent || '').trim();
+        if (!text) continue;
+        if (seen.has(text)) return true;
+        seen.add(text);
+      }
+      return false;
+    },
+
+    /**
+     * 用「隐藏 iframe」取文：让真实页面在 iframe 里跑脚本，等它把乱序正文还原后再读 DOM
+     *
+     * 站点机制（v1.6.0 实测）：
+     *   1. 服务端先下发**乱序**正文（前 20 段正确，其余为固定置换）；
+     *   2. 约 2.5s 后页面脚本原地还原段落顺序，并额外插入 20 个与原文完全相同的「诱饵段落」；
+     *   3. 再用动态插入的 `p[data-k…] { position:absolute; transform:scale(0) }` 把诱饵藏起来。
+     * 因此：XHR 永远拿到乱序版（脚本不执行）；iframe 里脚本会执行，但必须等还原完成再读，
+     * 读之前还要按 CSSOM 隐藏规则删掉诱饵。v1.5.0 的 iframe 方案失败，就是因为 load 后
+     * 只等了 400ms，读到的仍是还原前的乱序版。
+     *
+     * 返回 null 表示不可用（被 X-Frame-Options 拦截、超时、加载失败），调用方回退 XHR。
      */
     async fetchViaFrame(url, options = {}) {
-      const timeout = options.timeout || CONFIG.FRAME_TIMEOUT;
-      const settle = options.settle != null ? options.settle : CONFIG.FRAME_SETTLE;
+      const timeout = options.timeout || CONFIG.TEXT_FRAME_TIMEOUT;
       if (typeof document === 'undefined' || !document.body) return null;
 
-      const snapshot = await new Promise((resolve) => {
-        const frame = document.createElement('iframe');
-        frame.setAttribute('sandbox', 'allow-same-origin allow-scripts');
-        frame.setAttribute('referrerpolicy', 'no-referrer');
-        frame.setAttribute('aria-hidden', 'true');
-        frame.setAttribute('tabindex', '-1');
-        frame.style.cssText =
-          'position:fixed;left:-9999px;top:0;width:2px;height:2px;opacity:0;pointer-events:none;border:0;';
+      const frame = document.createElement('iframe');
+      frame.setAttribute('aria-hidden', 'true');
+      frame.setAttribute('tabindex', '-1');
+      frame.style.cssText =
+        'position:fixed;left:-9999px;top:0;width:900px;height:700px;opacity:0;pointer-events:none;border:0;';
+      document.body.appendChild(frame);
 
-        let done = false;
-        let timer = null;
-        const finish = (payload) => {
-          if (done) return;
-          done = true;
-          if (timer) clearTimeout(timer);
-          try {
-            frame.remove();
-          } catch (e) {
-            /* ignore */
-          }
-          resolve(payload);
-        };
-
-        timer = setTimeout(() => finish(null), timeout);
-        frame.addEventListener('error', () => finish(null));
-        frame.addEventListener('load', () => {
-          // 站点脚本（段落还原、懒加载等）通常在 load 之后一两个 tick 内完成
-          setTimeout(() => {
-            let html = '';
-            try {
-              const doc = frame.contentDocument;
-              if (doc && doc.documentElement) html = doc.documentElement.outerHTML;
-            } catch (e) {
-              html = '';
-            }
-            finish(html || null);
-          }, settle);
-        });
-
-        frame.src = url;
-        document.body.appendChild(frame);
-      });
-
-      if (!snapshot) return null;
+      const startedAt = Date.now();
+      let targetPath = '';
       try {
+        targetPath = new URL(url, location.href).pathname;
+      } catch (e) {
+        targetPath = '';
+      }
+      try {
+        // 1. 轮询等真正的目标文档：appending iframe 会先触发一次 about:blank 的 load，不能只听 load
+        const readyDoc = await new Promise((resolve) => {
+          let done = false;
+          let unsub = () => {};
+          const finish = (value) => {
+            if (done) return;
+            done = true;
+            unsub();
+            resolve(value);
+          };
+          const tick = () => {
+            if (Date.now() - startedAt > timeout) return finish(null);
+            let d = null;
+            try {
+              d = frame.contentDocument;
+            } catch (e) {
+              d = null;
+            }
+            let onTarget = true;
+            if (d && targetPath) {
+              try {
+                onTarget = new URL(d.URL).pathname === targetPath;
+              } catch (e) {
+                onTarget = false;
+              }
+            }
+            if (
+              d &&
+              onTarget &&
+              d.readyState !== 'loading' &&
+              d.querySelector('#TextContent, #acontent, .read-content')
+            ) {
+              return finish(d);
+            }
+          };
+          unsub = TextTicker.subscribe(tick);
+          frame.src = url;
+          tick();
+        });
+        if (!readyDoc) return null;
+        const doc = readyDoc;
+
+        // 2. 等站点脚本把乱序正文还原：还原后段落数会 +20（诱饵），或出现完全相同的段落
+        const countParagraphs = () => doc.querySelectorAll('#TextContent p').length;
+        const initialCount = countParagraphs();
+        let unscrambled = initialCount <= 20 || Utils.hasDuplicateParagraphs(doc);
+        if (!unscrambled) {
+          const waitUntil = Date.now() + CONFIG.TEXT_UNSCRAMBLE_WAIT;
+          while (Date.now() < waitUntil) {
+            await TextTicker.sleep(CONFIG.TEXT_UNSCRAMBLE_POLL);
+            if (!frame.contentDocument) return null;
+            if (countParagraphs() > initialCount || Utils.hasDuplicateParagraphs(doc)) {
+              unscrambled = true;
+              break;
+            }
+          }
+        }
+        if (!unscrambled) {
+          console.warn(
+            '[EPUB Downloader] iframe 内未观察到段落还原（站点可能改版），本页顺序可能仍是乱序:',
+            url
+          );
+        }
+
+        // 3. 删除诱饵段落后序列化
+        const removed = Utils.stripDecoyParagraphs(doc);
+        let html = '';
+        try {
+          html = doc.documentElement.outerHTML;
+        } catch (e) {
+          return null;
+        }
+        if (!html) return null;
         return {
-          doc: new DOMParser().parseFromString(snapshot, 'text/html'),
-          rawHtml: snapshot,
+          doc: new DOMParser().parseFromString(html, 'text/html'),
+          rawHtml: html,
           finalUrl: url,
+          removedDecoys: removed,
+          unscrambled,
         };
       } catch (e) {
         return null;
+      } finally {
+        try {
+          frame.remove();
+        } catch (e) {
+          /* ignore */
+        }
       }
     },
 
@@ -1076,84 +1289,35 @@
     constructor(fontDecryptor) {
       this.fontDecryptor = fontDecryptor;
       this.textRequests = 0;
-      // 取文通道：xhr(GM_xmlhttpRequest，快) / frame(真实导航 iframe，与读者所见一致)
-      this.fetchMode = 'xhr';
-      this.orderProbed = false;
+      // iframe 取文：站点在页面脚本里还原乱序段落，XHR 拿到的是未还原的乱序版
+      this.frameFailures = 0;
+      this.removedDecoys = 0;
+      this.unscrambledPages = 0;
+      this.checkedPages = 0;
     }
 
     /**
      * 取一页正文
      *
-     * 站点会对脚本请求下发「段落乱序」的正文（前 20 段正确，其余是置换过的），
-     * 这时必须用 iframe 走真实导航重取；iframe 不可用时回退 XHR，行为与旧版一致。
+     * 优先用隐藏 iframe（脚本会执行、段落会被还原）；连续失败才回退 XHR 并告警顺序风险。
      */
     async fetchPage(url, referer = location.href) {
-      if (this.fetchMode === 'frame') {
+      if (CONFIG.TEXT_FRAME && this.frameFailures < 3) {
         const framed = await Utils.fetchViaFrame(url);
         if (framed && framed.doc.querySelector('#TextContent, #acontent, .read-content')) {
+          this.frameFailures = 0;
+          this.removedDecoys += framed.removedDecoys || 0;
+          this.checkedPages += 1;
+          if (framed.unscrambled) this.unscrambledPages += 1;
           return framed;
         }
-        console.warn('[EPUB Downloader] iframe 取文失败，本页回退 XHR:', url);
+        this.frameFailures += 1;
+        console.warn(
+          `[EPUB Downloader] iframe 取文失败 ${this.frameFailures}/3，本页回退 XHR（正文顺序可能错乱）:`,
+          url
+        );
       }
       return Utils.fetchDoc(url, referer);
-    }
-
-    /** 正文段落指纹：只取每段开头，用于判断两种通道的段落顺序是否一致 */
-    static paragraphSignature(doc) {
-      if (!doc || !doc.querySelector) return null;
-      const el = doc.querySelector('#TextContent, #acontent, .read-content');
-      if (!el) return null;
-      const list = Array.from(el.querySelectorAll('p'))
-        .map((p) => (p.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 20))
-        .filter(Boolean);
-      return list.length > 0 ? list : null;
-    }
-
-    /**
-     * 探测正文通道（每卷只探一次）
-     *
-     * 同一 URL 分别用 XHR 与 iframe 各取一遍，比较段落顺序：
-     * - 顺序不同 → 站点按请求类型乱序，后续整卷改用 iframe 取文（读者所见顺序）
-     * - 顺序相同 → 两种通道拿到的是同一份文本，保持 XHR（快）
-     */
-    async probeFetchMode(sampleUrl) {
-      if (this.orderProbed) return this.fetchMode;
-      this.orderProbed = true;
-      if (!CONFIG.PROBE_TEXT_ORDER || !sampleUrl) return this.fetchMode;
-
-      try {
-        await Pacer.waitText();
-        this.textRequests += 1;
-        const xhr = await Utils.fetchDoc(sampleUrl);
-        const framed = await Utils.fetchViaFrame(sampleUrl, { timeout: CONFIG.FRAME_PROBE_TIMEOUT });
-
-        const sigXhr = ChapterScraper.paragraphSignature(xhr.doc);
-        const sigFrame = framed ? ChapterScraper.paragraphSignature(framed.doc) : null;
-        const both = Boolean(sigXhr && sigFrame);
-        const sameOrder =
-          both && sigXhr.length === sigFrame.length && sigXhr.every((t, i) => t === sigFrame[i]);
-
-        if (both && !sameOrder) this.fetchMode = 'frame';
-
-        console.info('[EPUB Downloader] 取文通道探测', {
-          url: sampleUrl,
-          xhrParagraphs: sigXhr ? sigXhr.length : 0,
-          frameParagraphs: sigFrame ? sigFrame.length : 0,
-          sameOrder: both ? sameOrder : null,
-          mode: this.fetchMode,
-        });
-
-        if (!sigFrame) {
-          console.warn('[EPUB Downloader] iframe 取文不可用（被嵌入策略拦截或超时），保持 XHR');
-        } else if (sameOrder) {
-          console.warn(
-            '[EPUB Downloader] XHR 与真实导航拿到同一份正文顺序；若阅读器里仍见乱序，说明站点数据本身如此，请把本行日志反馈'
-          );
-        }
-      } catch (err) {
-        console.warn('[EPUB Downloader] 取文通道探测失败，保持 XHR:', err);
-      }
-      return this.fetchMode;
     }
 
     /**
@@ -1435,16 +1599,20 @@
     async scrapeVolume(volume, allVolumes, updateStatus, bookMeta = {}) {
       const startedAt = Date.now();
       this.textRequests = 0;
+      this.frameFailures = 0;
+      this.removedDecoys = 0;
+      this.unscrambledPages = 0;
+      this.checkedPages = 0;
+
+      console.info('[EPUB Downloader] 取文通道', {
+        mode: CONFIG.TEXT_FRAME ? 'frame' : 'xhr',
+        note: CONFIG.TEXT_FRAME
+          ? '隐藏 iframe 执行站点脚本，等待段落还原后读取'
+          : '已关闭 iframe 取文，XHR 拿到的是乱序正文',
+      });
 
       // 1. 先检查并修复卷首可能的 cid(0)
       await this.repairLeadingMissingUrls(volume, allVolumes, updateStatus);
-
-      // 2. 探测正文通道：站点可能对 XHR 下发乱序正文，真实导航(iframe)才是读者所见
-      const probeChapter = volume.chapters.find((ch) => Boolean(ch.url));
-      if (probeChapter) {
-        updateStatus('探测正文通道...');
-        await this.probeFetchMode(probeChapter.url);
-      }
 
       const scrapedChapters = [];
       const imageRegistry = new Map(); // imageUrl -> { id, filename, mime, buffer } | null
@@ -1601,6 +1769,10 @@
           images: totalImages,
           imageFailed: Array.from(imageRegistry.values()).filter((v) => !v).length,
           imageTimedOut,
+          removedDecoys: this.removedDecoys,
+          unscrambledPages: this.unscrambledPages,
+          checkedPages: this.checkedPages,
+          textMode: CONFIG.TEXT_FRAME && this.frameFailures < 3 ? 'frame' : 'xhr',
           scrapeMs: Date.now() - startedAt,
         },
       };

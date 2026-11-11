@@ -2,7 +2,7 @@
 
 一个 Tampermonkey（油猴）用户脚本：在哔哩轻小说 / linovelib 的**分卷详情页**注入一个「EPUB下载」按钮，把当前分卷抓取并打包成 EPUB 2.0 电子书。
 
-- 版本：**v1.5.0**
+- 版本：**v1.6.0**
 - 脚本文件：[`bilinovel-epub.user.js`](./bilinovel-epub.user.js)
 - 依赖：Tampermonkey（无第三方库，无 `@require`）
 
@@ -15,7 +15,7 @@
 | 字体解密 | 识别 `readfont` PUA 混淆，内置 3500 条字符字典，可选导入自定义字典 / 轮廓 Hash 字典 |
 | 插图处理 | 全局并发池 + 重试退避，图床挂起时按宽限期跳过（降级为提示文本，不阻塞整卷） |
 | EPUB 2.0 | 自写 `ZipWriter`：`mimetype` 首条且 STORE，文本 deflate-raw，图片 STORE，兼容主流阅读器 |
-| 正文顺序通道 | 自动探测「脚本请求 vs 真实导航」的正文顺序差异，必要时切换取文通道（v1.5.0） |
+| 正文顺序还原 | 隐藏 iframe 执行站点脚本，等段落还原完成后剔除诱饵段落（v1.6.0） |
 | 速度档位 | 标准 / 快速 / 极速三档，命中 429、503 自动降档 |
 
 ## 安装
@@ -51,24 +51,30 @@
 
 收到 `429 / 503` 时会自动降档并继续，不需要手动干预。正文请求始终串行，这是站点的反爬约束，不要改成并发。
 
-## 正文顺序说明（v1.5.0）
+## 正文顺序说明（v1.6.0）
 
-站点的章节 HTML 对**脚本请求**（`GM_xmlhttpRequest` 等）下发的是**段落被置换过**的正文：前 20 段顺序正确，之后是一个固定置换（同一 URL 多次抓取顺序完全一致，与并发无关）。浏览器真实导航拿到的才是读者所见顺序。
+站点的章节正文不是直接可读的：服务端先下发**乱序**版本（前 20 段正确，其余为固定置换），约 **2.5 秒后**再由页面脚本**原地还原**顺序，并额外插入 20 个与原文完全相同的「诱饵段落」，用动态样式把它们隐藏起来。
 
-脚本因此增加了「取文通道探测」：
+这解释了两个现象：
 
-- 每卷开始时，用 XHR 与同源隐藏 iframe（真实导航）各取同一页，比较段落指纹；
-- 顺序不一致 → 整卷改走 iframe 取文；
-- 顺序一致 → 继续用更快的 XHR；
-- iframe 被拦截 / 超时 → 自动回退 XHR。
+- `GM_xmlhttpRequest` 拿到的永远是乱序版——页面脚本根本没有执行；
+- 单纯用 iframe 也不够：v1.5.0 在 iframe `load` 后只等了 400ms 就读，读到的还是还原前的版本。
 
-控制台会打印：
+v1.6.0 的做法：
+
+- 用隐藏 iframe 加载正文，让站点脚本真正执行；
+- 轮询等待**段落数 +20**（或出现完全相同的段落），确认还原已完成（实测约 2–3 秒）；
+- 按 CSSOM 里的隐藏规则删除 20 个诱饵段落，再序列化 DOM；
+- iframe 被 `X-Frame-Options` 拦截或连续失败 3 次时回退 XHR，并在控制台告警「正文顺序可能错乱」。
+
+代价是每页多等约 2–3 秒；这是站点脚本的固定延迟，无法绕过。控制台会打印：
 
 ```text
-[EPUB Downloader] 取文通道探测 { url, xhrParagraphs: 113, frameParagraphs: 113, sameOrder: false, mode: "frame" }
+[EPUB Downloader] 取文通道 { mode: "frame", note: "隐藏 iframe 执行站点脚本，等待段落还原后读取" }
+[EPUB Downloader] 用时统计(ms) { ..., textMode: "frame", removedDecoys: 100, unscrambledPages: 6, checkedPages: 6 }
 ```
 
-若 `sameOrder: true`，说明站点对两种请求给出的是同一份文本，此时正文顺序由站点数据决定，脚本侧无法还原。
+如何确认生效：`removedDecoys` 应约等于「读取页数 × 20」，`unscrambledPages` 应等于 `checkedPages`；若看到「iframe 取文失败」或「未观察到段落还原」，请把控制台日志反馈。
 
 ## 字体解密（PUA）
 
@@ -95,7 +101,7 @@
 v1.4.0 起改用自写 `ZipWriter`（不再依赖 JSZip 的异步分片调度）。若仍卡住，看控制台最后一行：停在 `抓取中` 是取文阶段，停在 `等待图片完成` 是图床挂起，停在 `打包中 xx%` 才是打包。
 
 **EPUB 里正文顺序混乱**
-见上文「正文顺序说明」，看 `取文通道探测` 日志的 `sameOrder` 与 `mode`。
+见上文「正文顺序说明」，看 `取文通道` 的 `mode` 与「用时统计」里的 `removedDecoys / unscrambledPages / checkedPages`。
 
 **个别插图显示 `[插图加载失败]`**
 图床超时或防盗链，脚本已按重试 + 宽限期策略处理；缺失处会降级为提示文本，不影响整卷导出。
@@ -105,7 +111,7 @@ v1.4.0 起改用自写 `ZipWriter`（不再依赖 JSZip 的异步分片调度）
 ```text
 UIController   视图层：路由识别、按钮挂载与状态机、日志诊断
 CatalogResolver 目录层：分卷结构与章节树解析，标记 cid(0) 缺失链接
-ChapterScraper  抓取层：分页串行取文、取文通道探测、cid(0) 双向修复、插图池
+ChapterScraper  抓取层：分页串行取文、隐藏 iframe 等段落还原、cid(0) 双向修复、插图池
 FontDecryptor   解密层：readfont 检测、TTF 解析、PUA / 轮廓 Hash 映射
 EpubBuilder     打包层：自写 ZipWriter、OPF/NCX/XHTML 生成、EPUB 2.0 校验
 Utils           基础设施：请求封装、DOM 解析、iframe 导航取文、sleep
