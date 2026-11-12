@@ -38,6 +38,7 @@
 
 1. 打开任意**分卷详情页**，例如 `https://www.linovelib.com/novel/2771/vol_132334.html`；
 2. 点击「目录」标题旁的 **EPUB下载**；
+<img width="1697" height="1011" alt="image" src="https://github.com/user-attachments/assets/3638420a-26e0-43cd-9114-3cbc5c4cbabe" />
 3. 按钮文字即进度：`读取本卷目录…` → `抓取中: 章节 x/y (第n页)` → `下载图片: a/b` → `正在打包 EPUB…` → `打包完成 x.xMB/y.ys`；
 4. 结束后浏览器自动下载 `书名 - 卷名.epub`。
 
