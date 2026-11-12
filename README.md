@@ -60,7 +60,7 @@
 
 本项目采用 **CC BY-NC-SA 4.0**（署名—非商业性使用—相同方式共享 4.0 国际）许可协议发布。
 
-完整条款：<https://creativecommons.org/licenses/by-nc-sa/4.0/deed.zh>
+协议全文见仓库 [LICENSE](./LICENSE) 文件，中文摘要见 <https://creativecommons.org/licenses/by-nc-sa/4.0/deed.zh>。
 
 | 你可以 | 但必须遵守 |
 | :--- | :--- |
