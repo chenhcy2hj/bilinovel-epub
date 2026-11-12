@@ -4,7 +4,6 @@
 // @version      1.6.0
 // @description  在哔哩轻小说分卷详情页（/novel/{id}/vol_{n}.html）新增 EPUB 下载按钮，支持cid(0)双向修复、TTF字体轮廓解密、插图并发重试、正文乱序还原（iframe）与EPUB 2.0打包
 // @author       MVP-Builder
-// @license      MIT https://opensource.org/license/mit
 // @updateURL    https://raw.githubusercontent.com/chenhcy2hj/bilinovel-epub/main/bilinovel-epub.user.js
 // @downloadURL  https://raw.githubusercontent.com/chenhcy2hj/bilinovel-epub/main/bilinovel-epub.user.js
 // @match        https://www.linovelib.com/novel/*.html
@@ -22,6 +21,11 @@
 // @connect      *
 // @run-at       document-end
 // ==/UserScript==
+
+/*
+ * 仅供个人学习与已购内容的本地备份使用，禁止商业使用、再分发或公开传播。
+ * Copyright © 2026 chenhcy2hj，保留所有权利（All rights reserved）。
+ */
 
 (function () {
   'use strict';
